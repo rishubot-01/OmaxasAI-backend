@@ -1,0 +1,14 @@
+﻿
+# ==========================================
+# OMAXAS AI BD - Development Dependencies
+# ==========================================
+
+# Core backend dependencies
+-r base.txt
+
+# Interactive Python shell for development
+# and debugging
+ipython>=8.0,<10.0
+
+# Python linting and code-quality checks
+ruff>=0.11,<1.0

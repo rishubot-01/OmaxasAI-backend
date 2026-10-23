@@ -1,0 +1,22 @@
+﻿
+# OmaxasAI self-hosted language model configuration
+# Options follow the vLLM serve configuration format.
+
+# Hugging Face model identifier
+model: "Qwen/Qwen3-0.6B"
+
+# Listen inside the container
+host: "0.0.0.0"
+port: 8000
+
+# Stable name for API clients
+served-model-name: "omaxasai-local"
+
+# Initial resource settings; tune after testing the available GPU
+max-model-len: 4096
+gpu-memory-utilization: 0.90
+max-num-seqs: 8
+
+# Logging
+uvicorn-log-level: "info"
+disable-log-requests: true

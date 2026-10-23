@@ -1,0 +1,34 @@
+﻿# ==========================================
+# OMAXAS AI BD - Testing Dependencies
+# ==========================================
+
+# Core backend dependencies
+-r base.txt
+
+
+# ==========================================
+# Python Test Runner
+# ==========================================
+
+# Run automated Python tests
+pytest>=8.3,<10.0
+
+
+# ==========================================
+# Django Integration
+# ==========================================
+
+# Django-specific fixtures, database setup,
+# settings configuration and test utilities
+pytest-django>=4.11,<5.0
+
+
+# ==========================================
+# Test Coverage
+# ==========================================
+
+# Generate test coverage reports
+pytest-cov>=6.0,<8.0
+
+# Coverage measurement utilities
+coverage>=7.6,<8.0

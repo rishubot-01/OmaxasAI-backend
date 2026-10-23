@@ -1,0 +1,57 @@
+﻿
+# ==========================================
+# OMAXAS AI BD - Core Dependencies
+# ==========================================
+
+# Django framework
+Django>=6.1,<6.2
+
+# REST API framework
+djangorestframework>=3.18,<3.19
+
+# JWT authentication
+djangorestframework-simplejwt>=5.5,<6.0
+
+# Cross-origin resource sharing
+django-cors-headers>=4.9,<5.0
+
+# Environment variables
+python-dotenv>=1.2,<2.0
+
+
+# ==========================================
+# AI Model Routing and Provider Integration
+# ==========================================
+
+# Unified AI provider integration
+litellm>=1.70,<2.0
+
+# Official OpenAI Python SDK
+openai>=1.0,<3.0
+
+
+# ==========================================
+# Document Processing
+# ==========================================
+
+# Read and process PDF documents
+pypdf>=5.0,<7.0
+
+# Read and process Word documents
+python-docx>=1.1,<2.0
+
+
+# ==========================================
+# Image Processing
+# ==========================================
+
+# Image loading, processing and validation
+Pillow>=11.0,<13.0
+
+
+# ==========================================
+# Cloud PostgreSQL Database
+# ==========================================
+
+# PostgreSQL driver for Django
+psycopg[binary]>=3.2,<4.0

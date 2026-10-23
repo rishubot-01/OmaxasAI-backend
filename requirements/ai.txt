@@ -1,0 +1,42 @@
+﻿# ==========================================
+# OMAXAS AI BD - AI Dependencies
+# ==========================================
+
+# Core Django and backend dependencies
+-r base.txt
+
+
+# ==========================================
+# LLM Provider Integration
+# ==========================================
+
+# Unified interface for multiple AI providers
+litellm>=1.90,<2.0
+
+# Official OpenAI Python SDK
+openai>=2.20,<4.0
+
+
+# ==========================================
+# Tokenization and Token Counting
+# ==========================================
+
+# Token counting and model tokenization utilities
+tiktoken>=0.9,<1.0
+
+
+# ==========================================
+# Local Embeddings and Model Inference
+# ==========================================
+
+# Semantic embeddings and similarity search support
+sentence-transformers>=4.1,<6.0
+
+# Transformer-based models and tokenizers
+transformers>=4.50,<6.0
+
+# Model loading, optimization, and inference utilities
+accelerate>=1.5,<2.0
+
+# Secure model weight handling
+safetensors>=0.5,<1.0

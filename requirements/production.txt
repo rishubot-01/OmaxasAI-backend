@@ -1,0 +1,12 @@
+﻿
+# Core backend dependencies
+-r base.txt
+
+# Production WSGI application server
+gunicorn>=23.0,<24.0
+
+# Static file serving for Django production deployments
+whitenoise>=6.9,<7.0
+
+# PostgreSQL database driver
+psycopg[binary]>=3.2,<4.0
