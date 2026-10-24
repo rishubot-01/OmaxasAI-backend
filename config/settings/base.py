@@ -1,4 +1,5 @@
-﻿"""
+﻿
+"""
 Base settings for OmaxasAI.
 Shared configuration for development, testing and production.
 """
@@ -44,8 +45,8 @@ ALLOWED_HOSTS = [
 ]
 
 # Google OAuth Client ID.
-# The same Web application Client ID must be configured
-# in the frontend and used to verify Google ID tokens.
+# Use the same Web application Client ID in the frontend
+# and when verifying Google ID tokens.
 GOOGLE_CLIENT_ID = os.getenv(
     "GOOGLE_CLIENT_ID",
     "",
@@ -92,8 +93,8 @@ AUTH_USER_MODEL = "accounts.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -275,8 +276,11 @@ CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "CORS_ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-        "https://omaxas-ai-frontend.vercel.app",
+        (
+            "https://omaxas-ai-frontend.vercel.app,"
+            "http://localhost:5173,"
+            "http://127.0.0.1:5173"
+        ),
     ).split(",")
     if origin.strip()
 ]
