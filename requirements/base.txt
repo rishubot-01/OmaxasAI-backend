@@ -1,4 +1,4 @@
-﻿
+
 # ==========================================
 # OMAXAS AI BD - Core Dependencies
 # ==========================================
@@ -55,3 +55,9 @@ Pillow>=11.0,<13.0
 
 # PostgreSQL driver for Django
 psycopg[binary]>=3.2,<4.0
+
+
+
+
+# Google Sign-In ID token verification
+google-auth>=2.0,<3.0
