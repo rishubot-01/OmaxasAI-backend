@@ -1,5 +1,4 @@
-﻿
-"""
+﻿"""
 Base settings for OmaxasAI.
 Shared configuration for development, testing and production.
 """
@@ -89,11 +88,13 @@ AUTH_USER_MODEL = "accounts.User"
 
 # ==================================================
 # 5. MIDDLEWARE
+# CORS middleware must be placed before CommonMiddleware
+# and as high as possible in the middleware list.
 # ==================================================
 
 MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
