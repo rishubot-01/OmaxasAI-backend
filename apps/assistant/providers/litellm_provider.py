@@ -26,8 +26,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-# Keep credential names consistent with ai_service.py and model_router.py.
-# ModelRegistry.credential_env_var can override the provider default.
+# Keep provider names consistent with ModelRegistry and model_router.py.
 SUPPORTED_PROVIDERS = {
     "openai": "OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -48,7 +47,15 @@ SUPPORTED_PROVIDERS = {
 }
 
 
-# Only explicitly permitted inference parameters.
+# Additional environment variable names accepted as fallbacks.
+# Actual secrets are never stored in the database or logged.
+PROVIDER_ENV_ALIASES = {
+    "gemini": ("GOOGLE_API_KEY",),
+    "huggingface": ("HF_TOKEN",),
+}
+
+
+# Only explicitly permitted inference parameters are passed through.
 ALLOWED_OPTIONS = {
     "temperature",
     "max_tokens",
@@ -57,6 +64,31 @@ ALLOWED_OPTIONS = {
     "frequency_penalty",
     "presence_penalty",
     "seed",
+}
+
+
+AUTHENTICATION_ERRORS = {
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "BadRequestError",
+    "NotFoundError",
+    "UnsupportedParamsError",
+    "InvalidRequestError",
+}
+
+
+TRANSIENT_ERROR_NAMES = {
+    "RateLimitError",
+    "ServiceUnavailableError",
+    "Timeout",
+    "TimeoutError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "TimeoutException",
+    "APIConnectionError",
+    "ConnectError",
+    "RemoteProtocolError",
+    "InternalServerError",
 }
 
 
@@ -113,6 +145,31 @@ def _extract_content(content) -> str:
     return "\n".join(parts).strip()
 
 
+def _get_retry_count() -> int:
+    """
+    Read LiteLLM retries from the environment.
+
+    Defaults to one retry for transient failures.
+    Set OMAXASAI_LITELLM_NUM_RETRIES=0 to disable retries.
+
+    Retrying a timed-out inference request can result in a second
+    provider request, so configure this with that possibility in mind.
+    """
+
+    raw_value = os.getenv(
+        "OMAXASAI_LITELLM_NUM_RETRIES",
+        "1",
+    ).strip()
+
+    try:
+        retries = int(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        retries = 1
+
+    # Bound retries to avoid unexpectedly long requests.
+    return min(max(retries, 0), 2)
+
+
 class LiteLLMProvider(BaseAIProvider):
     """
     Provider adapter for registered external AI models.
@@ -120,12 +177,11 @@ class LiteLLMProvider(BaseAIProvider):
     ModelRegistry.model_id should contain a valid LiteLLM model
     identifier. config["litellm_model"] overrides model_id.
 
-    OpenRouter model IDs should use the identifier expected by
-    LiteLLM, for example:
+    Gemini API-key requests use the Google AI Studio route:
+        gemini/gemini-model-name
 
-        openrouter/provider/model-name
-
-    The exact identifier depends on the upstream model.
+    Vertex AI uses a separate authentication configuration and
+    should not be configured as a Gemini API-key model in this adapter.
     """
 
     def supports(self, model) -> bool:
@@ -146,9 +202,8 @@ class LiteLLMProvider(BaseAIProvider):
         """
         Resolve credentials from environment variables only.
 
-        An explicitly configured variable is checked first.
-        If it is empty, the standard provider variable is checked
-        as a fallback, consistent with ai_service.py.
+        ModelRegistry.credential_env_var takes precedence.
+        Provider standard names and aliases are checked afterward.
         """
 
         provider = str(
@@ -169,6 +224,7 @@ class LiteLLMProvider(BaseAIProvider):
         for env_name in (
             configured_env_var,
             standard_env_var,
+            *PROVIDER_ENV_ALIASES.get(provider, ()),
         ):
             if env_name and env_name not in candidate_names:
                 candidate_names.append(env_name)
@@ -193,10 +249,10 @@ class LiteLLMProvider(BaseAIProvider):
 
     def _resolve_model_id(self, model) -> str:
         """
-        Resolve the exact LiteLLM model identifier.
+        Resolve the LiteLLM model identifier.
 
         config["litellm_model"] takes precedence over model_id.
-        Provider prefixes are not guessed or automatically rewritten.
+        Gemini IDs missing the Gemini API prefix are normalized.
         """
 
         config = getattr(model, "config", {})
@@ -221,14 +277,30 @@ class LiteLLMProvider(BaseAIProvider):
                 "The registered model has no LiteLLM model identifier."
             )
 
+        provider = str(
+            getattr(model, "provider", "")
+        ).strip().lower()
+
+        if provider == "gemini":
+            if model_id.startswith("vertex_ai/"):
+                raise ProviderConfigurationError(
+                    "This model uses the Vertex AI route, but the "
+                    "registered provider is configured for Gemini API "
+                    "key authentication. Use a gemini/ model ID for "
+                    "Google AI Studio, or configure Vertex AI separately."
+                )
+
+            if not model_id.startswith("gemini/"):
+                model_id = f"gemini/{model_id}"
+
         return model_id
 
     def _resolve_endpoint(self, model) -> str:
         """
         Resolve an optional provider API endpoint.
 
-        ModelRegistry.endpoint_url takes precedence over the
-        provider-specific environment configuration.
+        ModelRegistry.endpoint_url takes precedence over endpoint
+        environment variables.
         """
 
         configured_endpoint = str(
@@ -267,7 +339,7 @@ class LiteLLMProvider(BaseAIProvider):
         model,
         options: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Merge explicitly allowed non-secret inference options."""
+        """Merge explicitly allowed inference options."""
 
         registry_config = getattr(model, "config", {})
 
@@ -298,13 +370,83 @@ class LiteLLMProvider(BaseAIProvider):
 
         return safe_options
 
+    def _validate_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Validate the basic chat-message structure."""
+
+        if (
+            not isinstance(messages, list)
+            or not messages
+        ):
+            raise ProviderResponseError(
+                "A non-empty list of chat messages is required."
+            )
+
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise ProviderResponseError(
+                    f"Message at index {index} must be a dictionary."
+                )
+
+            role = message.get("role")
+
+            if not isinstance(role, str) or not role.strip():
+                raise ProviderResponseError(
+                    f"Message at index {index} requires a valid role."
+                )
+
+            if "content" not in message and not message.get("tool_calls"):
+                raise ProviderResponseError(
+                    f"Message at index {index} requires content "
+                    "or tool_calls."
+                )
+
+    @staticmethod
+    def _is_authentication_error(error_name: str) -> bool:
+        """Determine whether an error indicates rejected configuration."""
+
+        if error_name in AUTHENTICATION_ERRORS:
+            return True
+
+        normalized = error_name.lower()
+
+        return (
+            "authentication" in normalized
+            or "permissiondenied" in normalized
+            or "invalidrequest" in normalized
+            or "unsupportedparams" in normalized
+        )
+
+    @staticmethod
+    def _is_transient_error(error_name: str) -> bool:
+        """Determine whether an error is likely temporary."""
+
+        if error_name in TRANSIENT_ERROR_NAMES:
+            return True
+
+        normalized = error_name.lower()
+
+        return any(
+            fragment in normalized
+            for fragment in (
+                "timeout",
+                "ratelimit",
+                "connection",
+                "serviceunavailable",
+                "internalserver",
+                "temporarilyunavailable",
+            )
+        )
+
     def generate(
         self,
         *,
         model,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         stream: bool = False,
-        timeout: int = 60,
+        timeout: int | float = 90,
         options: dict[str, Any] | None = None,
     ) -> ProviderResult:
         """
@@ -324,21 +466,22 @@ class LiteLLMProvider(BaseAIProvider):
                 "Streaming is not implemented in this provider interface yet."
             )
 
-        if (
-            not isinstance(messages, list)
-            or not messages
-            or any(not isinstance(item, dict) for item in messages)
+        self._validate_messages(messages)
+
+        if isinstance(timeout, bool) or not isinstance(
+            timeout,
+            (int, float),
         ):
-            raise ProviderResponseError(
-                "A non-empty list of chat messages is required."
-            )
-
-        if isinstance(timeout, bool) or not isinstance(timeout, int):
             raise ProviderConfigurationError(
-                "Timeout must be an integer."
+                "Timeout must be a number of seconds."
             )
 
-        if timeout < 1 or timeout > 300:
+        timeout_seconds = float(timeout)
+
+        if (
+            timeout_seconds < 1
+            or timeout_seconds > 300
+        ):
             raise ProviderConfigurationError(
                 "Timeout must be between 1 and 300 seconds."
             )
@@ -359,13 +502,14 @@ class LiteLLMProvider(BaseAIProvider):
         model_id = self._resolve_model_id(model)
         endpoint = self._resolve_endpoint(model)
         safe_options = self._resolve_options(model, options)
+        retry_count = _get_retry_count()
 
         call_kwargs = {
             "model": model_id,
             "messages": messages,
             "api_key": api_key,
-            "timeout": timeout,
-            "num_retries": 0,
+            "timeout": timeout_seconds,
+            "num_retries": retry_count,
             "stream": False,
             **safe_options,
         }
@@ -379,40 +523,29 @@ class LiteLLMProvider(BaseAIProvider):
             response = litellm.completion(**call_kwargs)
 
         except Exception as exc:
-            # Log only safe operational metadata.
-            # Never log prompts, provider response bodies, or API keys.
+            # Log operational metadata only.
+            # Never log credentials, prompts, or provider response bodies.
             error_name = type(exc).__name__
 
             logger.warning(
                 "External AI call failed. provider=%s model=%s "
-                "error_type=%s timeout=%s",
+                "error_type=%s timeout=%s retries=%s",
                 provider_name,
                 model_id,
                 error_name,
-                timeout,
+                timeout_seconds,
+                retry_count,
             )
 
-            if error_name in {
-                "AuthenticationError",
-                "PermissionDeniedError",
-                "BadRequestError",
-                "NotFoundError",
-                "UnsupportedParamsError",
-            }:
+            if self._is_authentication_error(error_name):
                 raise ProviderConfigurationError(
                     "The AI provider rejected the request or its configuration."
                 ) from exc
 
-            if error_name in {
-                "RateLimitError",
-                "ServiceUnavailableError",
-                "Timeout",
-                "TimeoutError",
-                "APIConnectionError",
-                "InternalServerError",
-            }:
+            if self._is_transient_error(error_name):
                 raise ProviderUnavailableError(
-                    "The AI provider is temporarily unavailable."
+                    "The AI provider timed out or is temporarily unavailable. "
+                    "Try again later or check provider/network availability."
                 ) from exc
 
             raise ProviderError(
@@ -427,8 +560,14 @@ class LiteLLMProvider(BaseAIProvider):
             )
 
         first_choice = choices[0]
-        response_message = _get_value(first_choice, "message")
-        content = _get_value(response_message, "content")
+        response_message = _get_value(
+            first_choice,
+            "message",
+        )
+        content = _get_value(
+            response_message,
+            "content",
+        )
         answer = _extract_content(content)
 
         if not answer:

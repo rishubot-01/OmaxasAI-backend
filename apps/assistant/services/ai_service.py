@@ -2,10 +2,11 @@
 OmaxasAI AI service.
 
 Routes prompts to registered AI models through LiteLLM.
-Supports automatic routing and explicitly selected registry models.
+Supports automatic routing, explicitly selected models, and
+automatic failover when a model fails or exceeds its timeout.
 
 Provider credentials are read from environment variables.
-This service does not track monetary cost.
+Monetary cost is deliberately not tracked.
 """
 
 import logging
@@ -65,8 +66,6 @@ LITELLM_PROVIDER_PREFIXES = {
 }
 
 
-# Standard provider credential names.
-# ModelRegistry.credential_env_var can override these defaults.
 STANDARD_PROVIDER_ENV_VARS = {
     "openai": "OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -86,16 +85,6 @@ STANDARD_PROVIDER_ENV_VARS = {
 }
 
 
-# Backward-compatible aliases for provider credentials.
-#
-# The environment variable names are checked in this order:
-# 1. ModelRegistry.credential_env_var
-# 2. Standard provider variable
-# 3. Router provider variable
-# 4. Provider aliases
-#
-# Only environment-variable NAMES appear in logs.
-# Secret values are never logged.
 PROVIDER_ENV_ALIASES = {
     "gemini": (
         "GEMINI_API_KEY",
@@ -104,6 +93,9 @@ PROVIDER_ENV_ALIASES = {
     "nvidia": (
         "NVIDIA_NIM_API_KEY",
         "NVIDIA_API_KEY",
+    ),
+    "huggingface": (
+        "HF_TOKEN",
     ),
 }
 
@@ -118,16 +110,18 @@ ALLOWED_MODEL_OPTIONS = {
     "seed",
 }
 
-MIN_TIMEOUT_SECONDS = 5
-MAX_TIMEOUT_SECONDS = 120
 
-DEFAULT_TIMEOUT_SECONDS = 75
-DEFAULT_GEMINI_TIMEOUT_SECONDS = 90
-DEFAULT_GEMINI_THINK_TIMEOUT_SECONDS = 120
+# A single model attempt cannot be configured above 10 seconds.
+MIN_TIMEOUT_SECONDS = 1
+MAX_TIMEOUT_SECONDS = 10
+
+DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_GEMINI_TIMEOUT_SECONDS = 10
+DEFAULT_GEMINI_THINK_TIMEOUT_SECONDS = 10
 
 
 def _get_field(value, field_name, default=None):
-    """Read a value from a dictionary or an object."""
+    """Read a field from a dictionary or response object."""
 
     if isinstance(value, dict):
         return value.get(field_name, default)
@@ -148,11 +142,10 @@ def _get_provider_name(model):
 
     provider = getattr(model, "provider", "")
 
-    return (
-        provider.strip().lower()
-        if isinstance(provider, str)
-        else ""
-    )
+    if not isinstance(provider, str):
+        return ""
+
+    return provider.strip().lower()
 
 
 def _get_usage_value(usage, *field_names):
@@ -164,7 +157,7 @@ def _get_usage_value(usage, *field_names):
     for field_name in field_names:
         value = _get_field(usage, field_name)
 
-        if value is None:
+        if value is None or isinstance(value, bool):
             continue
 
         try:
@@ -179,7 +172,7 @@ def _get_usage_value(usage, *field_names):
 
 
 def _extract_text(content):
-    """Convert supported model response formats into plain text."""
+    """Convert supported model response formats to plain text."""
 
     if isinstance(content, str):
         return content.strip()
@@ -218,11 +211,7 @@ def _is_self_hosted_model(model):
 
 
 def _configuration_error(model, reason):
-    """
-    Log safe configuration diagnostics and create a configuration error.
-
-    Does not log prompts, API key values, or raw provider responses.
-    """
+    """Create a configuration error without logging secrets or prompts."""
 
     logger.warning(
         "AI model configuration error. provider=%s model_id=%s reason=%s",
@@ -257,15 +246,7 @@ def _validate_model_availability(model):
 
 
 def _get_provider_credentials(model):
-    """
-    Resolve provider API credentials from server environment variables.
-
-    NVIDIA supports both NVIDIA_NIM_API_KEY and NVIDIA_API_KEY.
-    Gemini supports GEMINI_API_KEY and GOOGLE_API_KEY.
-
-    A model-specific credential variable is preferred, but a missing
-    variable falls back to the provider's standard aliases.
-    """
+    """Resolve credentials from environment variables only."""
 
     provider = _get_provider_name(model)
 
@@ -288,10 +269,7 @@ def _get_provider_credentials(model):
 
     if _is_self_hosted_model(model):
         if configured_env_var:
-            api_key = os.getenv(
-                configured_env_var,
-                "",
-            ).strip()
+            api_key = os.getenv(configured_env_var, "").strip()
 
             if not api_key:
                 raise _configuration_error(
@@ -301,14 +279,14 @@ def _get_provider_credentials(model):
 
             return api_key
 
-        # Retain support for local OpenAI-compatible endpoints.
+        # Some self-hosted OpenAI-compatible endpoints do not require
+        # a real API key. Configure the endpoint separately.
         return "EMPTY"
 
     if not candidate_names:
         raise _configuration_error(
             model,
-            "No credential environment variable is configured "
-            "for this provider.",
+            "No credential environment variable is configured for this provider.",
         )
 
     for env_name in candidate_names:
@@ -317,10 +295,9 @@ def _get_provider_credentials(model):
         if api_key:
             return api_key
 
-    # Show checked variable NAMES, never their values.
     raise _configuration_error(
         model,
-        "The provider credential is missing. Checked environment "
+        "Provider credentials are missing. Checked environment "
         "variable names: " + ", ".join(candidate_names),
     )
 
@@ -329,8 +306,8 @@ def _get_litellm_model_name(model):
     """
     Resolve ModelRegistry.model_id to a LiteLLM model identifier.
 
-    config["litellm_model"] takes precedence and should contain a
-    complete LiteLLM identifier suitable for the registered provider.
+    config["litellm_model"] takes precedence over model_id.
+    Gemini's Google AI Studio route uses the gemini/ prefix.
     """
 
     config = _get_model_config(model)
@@ -341,15 +318,15 @@ def _get_litellm_model_name(model):
         isinstance(configured_model, str)
         and configured_model.strip()
     ):
-        return configured_model.strip()
+        model_id = configured_model.strip()
+    else:
+        model_id = getattr(model, "model_id", "")
 
-    model_id = getattr(model, "model_id", "")
-
-    model_id = (
-        model_id.strip()
-        if isinstance(model_id, str)
-        else ""
-    )
+        model_id = (
+            model_id.strip()
+            if isinstance(model_id, str)
+            else ""
+        )
 
     if not model_id:
         raise _configuration_error(
@@ -358,23 +335,41 @@ def _get_litellm_model_name(model):
         )
 
     provider = _get_provider_name(model)
+
+    if provider == "gemini":
+        if model_id.startswith("vertex_ai/"):
+            raise _configuration_error(
+                model,
+                "The model ID uses Vertex AI routing, but this provider "
+                "is configured for Gemini API-key authentication.",
+            )
+
+        if not model_id.startswith("gemini/"):
+            model_id = f"gemini/{model_id}"
+
+        return model_id
+
+    # Do not change the model identifier of other providers when a
+    # complete identifier is explicitly supplied in model config.
+    if (
+        isinstance(configured_model, str)
+        and configured_model.strip()
+    ):
+        return model_id
+
     prefix = LITELLM_PROVIDER_PREFIXES.get(provider)
 
-    if prefix is None:
+    if prefix is None or not prefix:
         return model_id
 
-    if provider == "openai":
-        return model_id
-
-    # Do not add the provider prefix a second time.
-    if prefix and model_id.startswith(prefix):
+    if model_id.startswith(prefix):
         return model_id
 
     return f"{prefix}{model_id}"
 
 
 def _get_model_endpoint(model):
-    """Resolve an optional provider or self-hosted API endpoint."""
+    """Resolve the registered or provider-specific API endpoint."""
 
     provider = _get_provider_name(model)
 
@@ -417,7 +412,11 @@ def _get_model_endpoint(model):
 
 
 def _get_timeout_seconds(model, mode):
-    """Return a bounded timeout, optionally configured per model."""
+    """
+    Get a model's timeout, capped at 10 seconds.
+
+    A larger timeout in ModelRegistry.config cannot override this cap.
+    """
 
     provider = _get_provider_name(model)
     config = _get_model_config(model)
@@ -448,6 +447,9 @@ def _get_timeout_seconds(model, mode):
     if configured_timeout is None:
         return default_timeout
 
+    if isinstance(configured_timeout, bool):
+        return default_timeout
+
     try:
         timeout_seconds = int(configured_timeout)
     except (TypeError, ValueError, OverflowError):
@@ -464,7 +466,7 @@ def _get_timeout_seconds(model, mode):
 
 
 def _build_model_options(model):
-    """Return only permitted inference options."""
+    """Return only explicitly allowed inference options."""
 
     config = _get_model_config(model)
 
@@ -554,6 +556,7 @@ def _call_model(model, message, mode, web_search):
         "messages": _build_messages(message, mode),
         "api_key": api_key,
         "timeout": timeout_seconds,
+        # Disable internal retries so failover is controlled here.
         "num_retries": 0,
         "stream": False,
         **_build_model_options(model),
@@ -562,10 +565,7 @@ def _call_model(model, message, mode, web_search):
     if endpoint:
         completion_kwargs["api_base"] = endpoint
 
-    # Apply reasoning options only when explicitly configured.
-    #
-    # This avoids sending a provider-specific parameter to every
-    # Gemini model based solely on a hardcoded model-name substring.
+    # Optional provider-specific reasoning configuration.
     config = _get_model_config(model)
     reasoning_effort = config.get("reasoning_effort")
 
@@ -580,16 +580,21 @@ def _call_model(model, message, mode, web_search):
         response = litellm.completion(**completion_kwargs)
 
     except Exception as exc:
+        error_name = type(exc).__name__
+
+        # Do not log prompts, secrets, or raw provider response bodies.
         logger.warning(
             "AI provider call failed. provider=%s model=%s "
             "error_type=%s mode=%s timeout_seconds=%s",
             provider_name,
             litellm_model_name,
-            type(exc).__name__,
+            error_name,
             mode,
             timeout_seconds,
         )
 
+        # Failures are wrapped so the candidate loop can proceed to
+        # the next eligible model, including after a timeout.
         raise AIServiceError(
             "The selected AI provider could not generate a response."
         ) from exc
@@ -633,21 +638,138 @@ def _call_model(model, message, mode, web_search):
     }
 
 
+def _append_candidate(candidates, seen_ids, model):
+    """Add an active registry model once, preserving candidate order."""
+
+    if model is None:
+        return
+
+    if not getattr(model, "active", False):
+        return
+
+    model_id = getattr(model, "pk", None)
+
+    if model_id is None:
+        return
+
+    if model_id in seen_ids:
+        return
+
+    seen_ids.add(model_id)
+    candidates.append(model)
+
+
+def _build_candidate_chain(message, mode, primary_model=None):
+    """
+    Build the model-attempt order.
+
+    Order:
+    1. Explicitly selected model, if supplied.
+    2. Router's preferred model.
+    3. Router's ranked fallback models.
+    4. Other active registered models, ordered by priority and name.
+
+    Unavailable models and models without credentials are skipped when
+    attempted. They do not prevent trying a later model.
+    """
+
+    route = None
+    candidates = []
+    seen_ids = set()
+
+    # Explicitly selected model must be attempted first.
+    _append_candidate(
+        candidates,
+        seen_ids,
+        primary_model,
+    )
+
+    try:
+        route = choose_model(
+            message,
+            mode=mode,
+            web_search=False,
+            stream=False,
+        )
+
+    except NoSuitableModelError:
+        # If routing has no suitable preferred model, still attempt
+        # other active registry entries below.
+        logger.warning(
+            "Automatic router found no preferred model. "
+            "Trying remaining active registry models."
+        )
+
+    if route is not None:
+        _append_candidate(
+            candidates,
+            seen_ids,
+            route.model,
+        )
+
+        for fallback_model in route.fallback_models:
+            _append_candidate(
+                candidates,
+                seen_ids,
+                fallback_model,
+            )
+
+    # Include remaining registered models so a failed preferred model
+    # does not end the request while another active model is available.
+    remaining_models = (
+        ModelRegistry.objects.filter(active=True)
+        .order_by("priority", "name")
+    )
+
+    for remaining_model in remaining_models:
+        _append_candidate(
+            candidates,
+            seen_ids,
+            remaining_model,
+        )
+
+    return route, candidates
+
+
+def _log_failed_attempt(model, attempt_number, error):
+    """Log safe metadata for a failed attempt before failover."""
+
+    cause = getattr(error, "__cause__", None)
+    underlying_error_name = (
+        type(cause).__name__
+        if cause is not None
+        else type(error).__name__
+    )
+
+    logger.warning(
+        "AI model attempt failed; trying next candidate. "
+        "attempt=%s provider=%s model_id=%s error_type=%s",
+        attempt_number,
+        _get_provider_name(model),
+        getattr(model, "model_id", "unknown"),
+        underlying_error_name,
+    )
+
+
 def generate_reply(
     message,
     *,
     mode="auto",
-    web_search=False,
+    web_search=True,
     user=None,
     selected_model_id=None,
 ):
     """
-    Generate a response through a selected or automatically routed model.
+    Generate a response with automatic per-model timeout failover.
 
-    An explicitly selected model is called directly without automatic
-    routing or fallback to another provider.
+    Every model call has a timeout capped at 10 seconds.
+    When a model fails, times out, or is misconfigured, the next
+    candidate is attempted.
 
-    Automatic mode uses the router and its configured fallback models.
+    An explicitly selected model is always tried first. If it fails,
+    other eligible models can provide a fallback response.
+
+    Returned metadata identifies the model that actually succeeded.
     """
 
     if not isinstance(message, str) or not message.strip():
@@ -669,119 +791,127 @@ def generate_reply(
             "Web Search integration is not available yet."
         )
 
-    # ---------------------------------------------------------
-    # Path 1: Explicit model selection
-    # ---------------------------------------------------------
-    # Skip model_router and quality scoring. This avoids unnecessary
-    # routing work when the frontend has selected a specific model.
-    # ---------------------------------------------------------
+    requested_model_id = None
+    primary_model = None
 
+    # Explicitly selected model: try it before any fallback.
     if selected_model_id is not None:
         try:
-            selected_model_id = int(selected_model_id)
+            requested_model_id = int(selected_model_id)
         except (TypeError, ValueError, OverflowError) as exc:
             raise AIServiceConfigurationError(
                 "The selected model ID is invalid."
             ) from exc
 
-        selected_model = ModelRegistry.objects.filter(
-            pk=selected_model_id,
+        primary_model = ModelRegistry.objects.filter(
+            pk=requested_model_id,
             active=True,
         ).first()
 
-        if selected_model is None:
+        if primary_model is None:
             raise AIServiceConfigurationError(
                 "The selected model was not found or is not active."
             )
 
-        _validate_model_availability(selected_model)
+    route, candidates = _build_candidate_chain(
+        message=message.strip(),
+        mode=mode,
+        primary_model=primary_model,
+    )
 
-        start_time = perf_counter()
-
-        result = _call_model(
-            model=selected_model,
-            message=message.strip(),
-            mode=mode,
-            web_search=False,
-        )
-
-        result["category"] = AIRequest.TaskCategory.GENERAL
-        result["fallback_used"] = False
-        result["response_time_ms"] = max(
-            0,
-            int((perf_counter() - start_time) * 1000),
-        )
-
-        return result
-
-    # ---------------------------------------------------------
-    # Path 2: Automatic routing
-    # ---------------------------------------------------------
-
-    try:
-        route = choose_model(
-            message,
-            mode=mode,
-            web_search=web_search,
-            stream=False,
-        )
-
-    except NoSuitableModelError as exc:
+    if not candidates:
         raise AIServiceError(
-            "No suitable AI model is configured or available."
-        ) from exc
+            "No active AI model is available for inference."
+        )
 
-    candidates = (route.model, *route.fallback_models)
+    # Selected-model requests retain the requested mode.
+    # Automatic requests use the router's resolved mode.
+    if requested_model_id is None and route is not None:
+        effective_mode = route.mode
+        category = route.category
+    else:
+        effective_mode = mode
+        category = (
+            route.category
+            if route is not None
+            else AIRequest.TaskCategory.GENERAL
+        )
 
-    effective_mode = route.mode
-    category = route.category
-    effective_web_search = route.web_search
-
-    start_time = perf_counter()
+    request_start = perf_counter()
     last_error = None
 
     for index, model in enumerate(candidates):
+        attempt_number = index + 1
+
         try:
             result = _call_model(
                 model=model,
                 message=message.strip(),
                 mode=effective_mode,
-                web_search=effective_web_search,
+                web_search=False,
             )
 
+            # The response must identify the model that actually
+            # generated the answer, including when it is a fallback.
             result["category"] = category
             result["fallback_used"] = index > 0
+            result["requested_model_registry_id"] = requested_model_id
+            result["fallback_from_registry_id"] = (
+                candidates[0].pk
+                if index > 0
+                else None
+            )
+
             result["response_time_ms"] = max(
                 0,
-                int((perf_counter() - start_time) * 1000),
+                int((perf_counter() - request_start) * 1000),
             )
+
+            if index > 0:
+                logger.info(
+                    "AI fallback succeeded. requested_model_id=%s "
+                    "actual_model_id=%s provider=%s attempts=%s",
+                    requested_model_id,
+                    result.get("model_registry_id"),
+                    result.get("provider"),
+                    attempt_number,
+                )
 
             return result
 
-        except AIServiceConfigurationError:
-            # Configuration errors should remain explicit. Do not
-            # hide missing credentials or an invalid endpoint.
-            raise
-
-        except AIServiceError as exc:
+        except (AIServiceConfigurationError, AIServiceError) as exc:
+            # A missing credential, unavailable model, provider error,
+            # or timeout must not stop the fallback chain.
             last_error = exc
 
-            logger.warning(
-                "AI model attempt failed. provider=%s model=%s",
-                _get_provider_name(model),
-                getattr(model, "model_id", "unknown"),
+            _log_failed_attempt(
+                model,
+                attempt_number,
+                exc,
             )
+
+            continue
 
         except Exception as exc:
             last_error = exc
 
-            logger.warning(
-                "Unexpected AI model failure. provider=%s "
-                "error_type=%s",
-                _get_provider_name(model),
-                type(exc).__name__,
+            _log_failed_attempt(
+                model,
+                attempt_number,
+                exc,
             )
 
+            continue
+
+    # All candidate attempts failed or timed out.
+    logger.error(
+        "All AI model attempts failed. candidate_count=%s "
+        "requested_model_id=%s",
+        len(candidates),
+        requested_model_id,
+    )
+
     raise AIServiceError(
-        "All eligible AI model attempts failed."
+        "All eligible AI models failed or timed out. "
+        "Please try again shortly."
     ) from last_error

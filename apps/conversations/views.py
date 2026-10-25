@@ -16,6 +16,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.assistant.models import ModelRegistry
 from apps.assistant.serializers import AssistantPromptSerializer
 from apps.assistant.services.ai_service import (
     AIServiceConfigurationError,
@@ -33,6 +34,25 @@ from .serializers import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_registry_id(value):
+    """
+    Normalize a registry ID to a positive integer.
+
+    Returns None for missing or invalid IDs.
+    Boolean values are rejected because bool is a subclass of int.
+    """
+
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        registry_id = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    return registry_id if registry_id > 0 else None
 
 
 class ConversationListCreateView(generics.ListCreateAPIView):
@@ -66,7 +86,7 @@ class ConversationListCreateView(generics.ListCreateAPIView):
         return queryset
 
     def perform_create(self, serializer):
-        # Ownership is always assigned by the backend.
+        # Conversation ownership is always assigned by the backend.
         serializer.save(user=self.request.user)
 
 
@@ -119,8 +139,8 @@ class SendMessageView(APIView):
 
     POST /api/conversations/<conversation_id>/messages/send/
 
-    Messages are persisted in the conversation history.
-    Responses are currently non-streaming.
+    Uses the AI service's timeout and model-fallback logic.
+    The response is non-streaming.
     """
 
     permission_classes = [IsAuthenticated]
@@ -169,9 +189,7 @@ class SendMessageView(APIView):
         web_search = prompt["web_search"]
         selected_model_id = prompt.get("selected_model_id")
 
-        # Persist the user's message before calling the provider.
-        # If the provider is unavailable, the user's message remains
-        # available in conversation history.
+        # Persist the user's message before generating an AI response.
         user_message = Message.objects.create(
             conversation=conversation,
             role=Message.RoleChoices.USER,
@@ -180,7 +198,7 @@ class SendMessageView(APIView):
             web_search_used=web_search,
         )
 
-        # Set a useful title for a newly created conversation.
+        # Give a new conversation a useful title.
         if conversation.title == "New chat":
             conversation.title = message_text[:80]
 
@@ -195,10 +213,6 @@ class SendMessageView(APIView):
                 mode=mode,
                 web_search=web_search,
                 user=request.user,
-
-                # IMPORTANT:
-                # Forward the selected ModelRegistry database ID.
-                # None means automatic model routing.
                 selected_model_id=selected_model_id,
             )
 
@@ -298,6 +312,8 @@ class SendMessageView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
+        answer = answer.strip()
+
         actual_provider = str(
             metadata.get("provider", "")
         ).strip()[:50]
@@ -308,24 +324,83 @@ class SendMessageView(APIView):
 
         actual_registry_id = metadata.get("model_registry_id")
 
-        # Do not report an explicitly selected model as successful
-        # if the service did not identify the registry record used.
-        if selected_model_id is not None:
-            try:
-                registry_id_matches = (
-                    actual_registry_id is not None
-                    and int(actual_registry_id)
-                    == int(selected_model_id)
-                )
-            except (TypeError, ValueError, OverflowError):
-                registry_id_matches = False
+        fallback_used = metadata.get("fallback_used") is True
 
-            if not registry_id_matches:
+        requested_registry_id = _normalize_registry_id(
+            selected_model_id
+        )
+
+        actual_registry_id_int = _normalize_registry_id(
+            actual_registry_id
+        )
+
+        # Verify selected-model requests against the model actually used.
+        #
+        # A different model is allowed only when generate_reply()
+        # explicitly reports that a fallback succeeded.
+        if selected_model_id is not None:
+            if requested_registry_id is None:
+                logger.error(
+                    "Invalid selected model ID. conversation_id=%s",
+                    conversation.pk,
+                )
+
+                return Response(
+                    {
+                        "detail": (
+                            "The selected model ID is invalid. "
+                            "Your message has been saved."
+                        ),
+                        "conversation_id": conversation.pk,
+                        "user_message_id": user_message.pk,
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+            # Verify that the reported actual registry ID exists.
+            actual_model_exists = (
+                actual_registry_id_int is not None
+                and ModelRegistry.objects.filter(
+                    pk=actual_registry_id_int
+                ).exists()
+            )
+
+            if not actual_model_exists:
+                logger.error(
+                    "AI service returned an invalid registry ID. "
+                    "conversation_id=%s selected_model_id=%s "
+                    "actual_registry_id=%s fallback_used=%s",
+                    conversation.pk,
+                    requested_registry_id,
+                    actual_registry_id,
+                    fallback_used,
+                )
+
+                return Response(
+                    {
+                        "detail": (
+                            "The AI model could not be verified. "
+                            "Your message has been saved."
+                        ),
+                        "conversation_id": conversation.pk,
+                        "user_message_id": user_message.pk,
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+            selected_model_matches = (
+                actual_registry_id_int == requested_registry_id
+            )
+
+            if not selected_model_matches and not fallback_used:
                 logger.error(
                     "Selected model verification failed. "
-                    "conversation_id=%s selected_model_id=%s",
+                    "conversation_id=%s selected_model_id=%s "
+                    "actual_registry_id=%s fallback_used=%s",
                     conversation.pk,
-                    selected_model_id,
+                    requested_registry_id,
+                    actual_registry_id_int,
+                    fallback_used,
                 )
 
                 return Response(
@@ -340,9 +415,17 @@ class SendMessageView(APIView):
                     status=status.HTTP_502_BAD_GATEWAY,
                 )
 
-        answer = answer.strip()
+            if fallback_used and not selected_model_matches:
+                logger.info(
+                    "Selected model failed; fallback model succeeded. "
+                    "conversation_id=%s requested_model_id=%s "
+                    "actual_model_id=%s",
+                    conversation.pk,
+                    requested_registry_id,
+                    actual_registry_id_int,
+                )
 
-        # Store response metadata with the persisted assistant message.
+        # Save the assistant response and the actual model metadata.
         assistant_message = Message.objects.create(
             conversation=conversation,
             role=Message.RoleChoices.ASSISTANT,
@@ -358,8 +441,13 @@ class SendMessageView(APIView):
                     "category",
                     "general",
                 ),
-                "fallback_used": bool(
-                    metadata.get("fallback_used", False)
+                "fallback_used": fallback_used,
+                "requested_model_registry_id": metadata.get(
+                    "requested_model_registry_id",
+                    requested_registry_id,
+                ),
+                "fallback_from_registry_id": metadata.get(
+                    "fallback_from_registry_id"
                 ),
                 "input_tokens": metadata.get("input_tokens"),
                 "output_tokens": metadata.get("output_tokens"),
